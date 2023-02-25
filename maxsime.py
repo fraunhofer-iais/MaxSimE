@@ -1,141 +1,274 @@
-import sys
-sys.path.insert(0, './')
-from colbert.infra import Run, RunConfig, ColBERTConfig
-from colbert import Searcher, Indexer
-from colbert.data import Queries, Collection
-import torch
-from sentence_transformers import SentenceTransformer
-import os
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
-#CUDA_LAUNCH_BLOCKING=1
+import pandas as pd
+import seaborn as sns
+import torch
+from matplotlib.patches import Rectangle
+from sentence_transformers import CrossEncoder, SentenceTransformer
+from tqdm.autonotebook import tqdm
+
+from colbert import Indexer, Searcher
+from colbert.data import Collection
+from colbert.infra import ColBERTConfig, Run, RunConfig
 
 
+class MaxSimE:
+    dataroot = Path("~/data/LOTTE").expanduser()
+    dataset = "pooled"
+    datasplit = "dev"
+    nbits = 2  # encode each dimension with 2 bits
+    doc_maxlen = 300  # truncate passages at 300 tokens
+    checkpoint = Path("~/models/colbertv2.0").expanduser()
+    index_name = f"{dataset}.{datasplit}.{nbits}bits"
 
+    def __init__(
+        self,
+        collection: Collection,
+        model_type: str = "colbert",
+        model: str = "colbert",
+        reindex: bool = False,
+        query_maxlen=512,
+    ):
+        self.collection = collection
+        self.query_maxlen = query_maxlen
+        self.type = model_type
 
-class Maxsime:
-    dataroot = 'downloads/lotte'
-    dataset = 'pooled'
-    datasplit = 'dev'    
-    nbits = 2   # encode each dimension with 2 bits
-    doc_maxlen = 300   # truncate passages at 300 tokens
-    checkpoint = 'downloads/colbertv2.0'
-    index_name = f'{dataset}.{datasplit}.{nbits}bits'
-    collection = Collection(path=os.path.join(dataroot, dataset, datasplit, 'collection.tsv'))
+        match model_type:
+            case "bi-encoder":
+                # load classic BERT models with SentenceTransformer library (mean-pooling will be added)
+                self.model = SentenceTransformer(model)
 
+            case "cross-encoder":
+                self.model = CrossEncoder(model)
+                self.model.model.cuda()
 
+            case "colbert":
+                # load msmarco-pretrained colbertv2 based searcher
+                with Run().context(
+                    RunConfig(experiment="MaxSimE", nranks=2)
+                ):  # nranks specifies the number of GPUs to use.
+                    config = ColBERTConfig(
+                        doc_maxlen=self.doc_maxlen,
+                        nbits=self.nbits,
+                        query_maxlen=self.query_maxlen,
+                    )
 
-    def __init__(self, model ="colbert"):
-        if model !="colbert":
-            self.type = "bert"
-            self.model = SentenceTransformer(model)
-        else:            
-            self.type = "colbert"
-            config = ColBERTConfig(doc_maxlen=self.doc_maxlen, nbits=self.nbits)
-            #indexer = Indexer(checkpoint=self.checkpoint, config=config)
-            #indexer.index(name=self.index_name, collection=self.collection, overwrite=True)
-            with Run().context(RunConfig(experiment='maxsime')):
-                self.searcher = Searcher(index=self.index_name)
+                    if reindex:
+                        # this initializes the index
+                        indexer = Indexer(checkpoint=self.checkpoint, config=config)
+                        # this loads the pretrained model, encodes collection and indexes the passages into faiss
+                        indexer.index(
+                            name=self.index_name,
+                            collection=self.collection,
+                            overwrite=True,
+                        )
 
+                    # colBERT index searcher
+                    self.searcher = Searcher(index=self.index_name)
 
-    def get_tokens(self,sent):
+    def get_tokens(self, sequence, query: bool = False):
+        match self.type:
+            case "colbert":
+                if query:
+                    return self.searcher.checkpoint.query_tokenizer.tokenize(
+                        [sequence], add_special_tokens=True
+                    )[0][: self.query_maxlen]
+                else:
+                    return self.searcher.checkpoint.doc_tokenizer.tokenize(
+                        [sequence], add_special_tokens=True
+                    )[0][: self.query_maxlen]
+
+            case "bi-encoder" | "cross-encoder":
+                return self.model.tokenizer.convert_ids_to_tokens(
+                    self.model.tokenizer.encode(sequence)
+                )[: self.query_maxlen]
+
+    def get_embeddings(self, sequence):
+        match self.type:
+            case "colbert":
+                return self.searcher.checkpoint.queryFromText([sequence])[
+                    : self.query_maxlen
+                ]
+            case "bi-encoder":
+                return self.model.encode(sequence, output_value="token_embeddings")[
+                    : self.query_maxlen
+                ]
+            case "cross-encoder":
+                features = self.model.tokenizer(
+                    [sequence], return_tensors="pt", truncation=True
+                )
+                features = {k: f.cuda() for k, f in features.items()}
+                output = self.model.model(**features, output_hidden_states=True)
+                return output.hidden_states[-1][0][: self.query_maxlen].detach()
+
+    def get_scores(self, Q, D):
         if self.type == "colbert":
-            return self.searcher.checkpoint.doc_tokenizer.tokenize([sent], add_special_tokens=True)[0]
+            return torch.mm(Q[0].float(), D[0].permute(1, 0).float())
         else:
-            return self.model.tokenizer.convert_ids_to_tokens(self.model.tokenizer.encode(sent))
-        
-    def get_embeddings(self,sent):
-        if self.type == "colbert":
-            return self.searcher.checkpoint.queryFromText([sent])
-        else:
-            return self.model.encode(sent, output_value="token_embeddings")
-    
-    def get_scores(self,Q,D):        
-        if self.type == "colbert":
-            return torch.mm(Q[0].float(),D[0].permute(1,0).float())
-        else:
-            return torch.nn.functional.normalize(Q).mm(torch.nn.functional.normalize(D).permute(1,0))
+            return torch.nn.functional.normalize(Q).mm(
+                torch.nn.functional.normalize(D).permute(1, 0)
+            )
 
-    
-    def explain_match(self,query, doc_text):        
-        query_tokens = self.get_tokens(query)
-        Q = self.get_embeddings(query)        
-        doc_tokens = self.get_tokens(doc_text)        
-        D = self.get_embeddings(doc_text)        
-        scores = self.get_scores(Q,D)
-        try:
-            matches = [(query_tokens[i],doc_tokens[scores.argmax(1)[i]], scores[i,scores.argmax(1)[i]].item()) for i in range(len(query_tokens)) if query_tokens[i] !="[MASK]"]
-        except:
-            return
-        sorted_matches = sorted(matches, key=lambda tup: tup[-1], reverse=True)                
-        explained_text = doc_tokens
-        for i in range(len(query_tokens)) :
-            if query_tokens[i] !="[MASK]":
-                explained_text[scores.argmax(1)[i]] += f"[={query_tokens[i]}]"        
-        return sorted_matches, " ".join(explained_text)
-    
-    def evaluate(self, matches1, matches2):
-        if matches1 is None:
-            return None
-        if matches2 is None:
-            return 0,0
-        target = set([t[1] for t in matches1[0] if t[0] != "[D]"])        
-        y = set([t[1] for t in matches2[0]])        
-        word_acc = len(y & target) / len(target)       
-        target = set([(t[0],t[1]) for t in matches1[0] if t[0] != "[D]"])
-        y = set([(t[0],t[1]) for t in matches2[0]])        
-        pair_acc = len(y & target) / len(target)        
-        return word_acc, pair_acc
+    def explain_match(self, query, doc, strip_special: bool = True):
+        # tokenize
+        query_tokens = self.get_tokens(query, query=True)
+        doc_tokens = self.get_tokens(doc)
 
-if __name__ == '__main__':    
+        # optionally strip query mask tokens
+        special_tokens = ["[MASK]", "[SEP]", "[Q]"]
+        non_special_token_ids = [
+            i for i, t in enumerate(query_tokens) if t not in special_tokens
+        ]
 
-    query = "Why do kittens like packets?"
-    doc ="Cats enjoy boxes because they love hiding places. When they are inside a box they are covered on all sides but one. Which means they are safe and can keep an eye out on the one open side. Boxes also allow for the cats to quickly dart from the box if something of interest appears, and allows for a quick retreat if necessary."
-    mxsm1 = Maxsime(model="colbert")
-    mxsm2 = Maxsime(model="bert-base-uncased")
+        # get embeddings from model
+        Q = self.get_embeddings(query).cpu()
+        D = self.get_embeddings(doc).cpu()
 
-    results1 = mxsm1.explain_match(query,doc)
-    results2 = mxsm2.explain_match(query,doc)
-    print(mxsm1.evaluate(results1, results2))
-    
-    
-    dataroot = 'downloads/lotte'
-    #dataset = 'lifestyle'
-    dataset = 'pooled'
-    datasplit = 'dev'
+        # compute cosine similarity,
+        scores = self.get_scores(Q, D)
+        similarity = scores.max(-1)[0].sum()
+        # only select non [MASK] query tokens
+        if strip_special:
+            query_tokens = [query_tokens[i] for i in non_special_token_ids]
+            scores = scores[non_special_token_ids]
+        # compute max sim candidates
+        maxsim_ids = scores.argmax(1).unique()
+        # shrink score matrix to candidates
+        scores = scores[:, maxsim_ids]
+        # strip document tokens that aren't selected by MaxSim
+        doc_tokens = [
+            doc_tokens[i] if i < len(doc_tokens) else "[PAD]" for i in maxsim_ids
+        ]
 
-    queries = os.path.join(dataroot, dataset, datasplit, 'questions.search.tsv')
-    collection = os.path.join(dataroot, dataset, datasplit, 'collection.tsv')
-
-    queries = Queries(path=queries)
-    
-    docs = []
-    for q in queries:
-        # Find the top-3 passages for this query
-        results = mxsm1.searcher.search(q[1], k=1)
-        for passage_id, passage_rank, passage_score in zip(*results):
-            docs.append(mxsm1.searcher.collection[passage_id])
-            break
+        # put everything in one dataframe
+        return (
+            scores,
+            similarity,
+            doc_tokens,
+            pd.DataFrame.from_dict(
+                {
+                    "query_token": query_tokens,
+                    "doc_token": [doc_tokens[i] for i in scores.argmax(-1)],
+                    "score": scores.max(-1)[0],
+                }
+            ).set_index("query_token"),
+        )
 
 
-    
-    #print(mxsm1.evaluate(mxsm1.explain_match(queries[0],docs[0]), mxsm2.explain_match(queries[0],docs[0])))
-    eval_results = [mxsm1.evaluate(mxsm1.explain_match(q[1],d), mxsm2.explain_match(q[1],d)) for q,d in zip(queries,docs)]
+def align_explanations(expl1: pd.DataFrame, expl2: pd.DataFrame):
+    # join explanations
+    aligned = expl1.join(expl2, lsuffix="_1", rsuffix="_2", how="outer")
+    # drop the [Q] token
+    # return aligned.drop(index="[Q]")
+    return aligned
 
-    a = np.array([t for t in eval_results if t!= None])
-    print(a.shape)
-    print(np.mean(a, axis=0))
-    # Print out the top-k retrieved passages
-    exit()
-    
-        
 
-    
+def fidelity(expl1: pd.DataFrame, expl2: pd.DataFrame):
+    expl = align_explanations(expl1, expl2)
 
-    query = "how much should i feed my 1 year old english mastiff?"
-    doc = "I have a 2 1/2 year old bull mastiff. I have been feeding him Blue Buffalo since I got him at 8 weeks old. He is very lean and active for a bull mastiff. I feed him about 3-4 cups twice a day which averages about 130.00 a month. It is very important that you can afford this breed. I just had to take mine to the vet because he developed some sort of allergies on his skin, eyes and ears and the vet bill was $210.00 with all his medication. This wasn't an option I had to take him an get all his meds or he would have gotten worse. They're just like your children, you can expect things to come up and you need to be able to care for them."
-    print(mxsm1.explain_match(query,doc))
-    print(mxsm2.explain_match(query,doc))    
-    query = "are zebra loaches safe with shrimp?"
-    doc = "Amano shrimp are good tank mates for community fish. They'll ignore your fish altogether. And they eat algae 24x7, which never hurts. Amano shrimp require brackish water for breeding, so won't breed in most tanks. This also makes them difficult to find. Cherry shrimp (and their color varieties) will also be no threat to your fish. But, they are very small, so aggressive fish (barbs, for example) may go after them. They breed quite easily and rapidly, so if you want more of them make sure you have plenty of hiding places for the young shrimp. Cherry shrimp are also algae eaters, though being so small you'll need huge quantities of them to have an real impact if algae controll is a goal. Really, for most shrimp in tanks, the issue isn't if they are a danger to the fish, but if the fish will be a danger to the shrimps. Even larger shrimp may find their extremities and tails the target of nipping. The tetras shouldn't be a problem for the shrimp, but the loaches may go after them. Edit: One heads up about shrimp (and most aquarium invertebrates, actually). A lot of medications and chemicals you might use in a tank are poisonous to them. So once they are in there, you'll need to be extra careful with what you put into the tank, and check that it is safe for shrimp."
-    print(mxsm1.explain_match(query,doc))
-    print(mxsm2.explain_match(query,doc))
+    token_precision = (
+        expl["doc_token_2"].apply(lambda t: t in expl["doc_token_1"]).mean()
+    )
+    match_accuracy = (
+        expl[["doc_token_1", "doc_token_2"]]
+        .apply(lambda row: row[0] == row[1], axis=1)
+        .mean()
+    )
+    spearman = expl[["score_1", "score_2"]].corr(method="spearman")["score_1"][
+        "score_2"
+    ]
+    pearson = expl[["score_1", "score_2"]].corr(method="pearson")["score_1"]["score_2"]
+
+    return token_precision, match_accuracy, spearman, pearson
+
+
+def evaluate(mxsm1, mxsm2, queries, documents):
+    doc_idx = 0
+    token_precision, match_accuracy, spearman, pearson = [
+        *zip(
+            *[
+                fidelity(
+                    mxsm1.explain_match(query[1], doc)[-1],
+                    mxsm2.explain_match(query[1], doc)[-1],
+                )
+                for query, doc in tqdm(zip(queries, documents), total=len(queries))
+            ]
+        )
+    ]
+
+    return (
+        torch.Tensor(token_precision),
+        torch.Tensor(match_accuracy),
+        torch.Tensor(spearman),
+        torch.Tensor(pearson),
+    )
+
+
+def visualize_match(scores, similarity, doc_tokens, expl, annot=False, ax=None):
+    if ax is None:
+        # define new figure
+        plt.figure(
+            figsize=(len(doc_tokens) // 1.5, len(query_tokens) // 2), tight_layout=True
+        )
+        ax = plt.gca()
+
+    ax.set_title(f"MaxSim scores; score={similarity:.2f}")
+
+    # heatmap of the token similarities
+    sns.heatmap(
+        scores,
+        yticklabels=expl.index,
+        xticklabels=doc_tokens,
+        square=False,
+        ax=ax,
+        annot=annot,
+        fmt=".2f",
+        cbar=False,
+        cmap="gray",
+    )
+
+    # highlight MaxSim matches
+    for i, j in enumerate(scores.argmax(1)):
+        ax.add_patch(Rectangle((j, i), 1, 1, fill=False, edgecolor="blue", lw=3))
+
+
+def visualize_correlation(
+    expl,
+    text: bool = True,
+    rotate_xticks: int = 0,
+    labelsize="medium",
+    labelweight="semibold",
+    col_names=["score_1", "score_2"],
+):
+    # sort by score value
+    expl = expl.sort_values(by=col_names, ascending=False)
+    # plot
+    scp = sns.scatterplot(expl)
+    # rotate xticks
+    scp.axes.tick_params(axis="x", rotation=rotate_xticks)
+    scp.axes.set(ylabel="$cos$ similarity")
+
+    if text:
+        # add labels text
+        for i in range(expl.shape[0]):
+            if not np.isnan(expl[col_names[0]][i]):
+                scp.text(
+                    i + 0.01,
+                    expl[col_names[0]][i] - 0.02,
+                    expl["doc_token_1"][i],
+                    horizontalalignment="left",
+                    size=labelsize,
+                    color="blue",
+                    weight=labelweight,
+                )
+                scp.text(
+                    i + 0.01,
+                    expl[col_names[1]][i] + 0.01,
+                    expl["doc_token_2"][i],
+                    horizontalalignment="left",
+                    size=labelsize,
+                    color="orange",
+                    weight=labelweight,
+                )
